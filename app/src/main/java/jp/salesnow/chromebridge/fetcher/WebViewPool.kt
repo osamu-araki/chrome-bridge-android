@@ -71,6 +71,13 @@ class WebViewPool(
     private val MAX_AI_MODE_REDETECTS = 6
     private val AI_MODE_REDETECT_INTERVAL_MS = 2500L
 
+    // [2026-08-01] 通常 Google /search の描画待ち。SPA/低速レンダリングで本文がまだ育っていない
+    //   だけの SERP を「blocked」と即断せず、最大 MAX_SERP_REDETECTS 回まで再判定して待つ。
+    //   (旧: 3s one-shot 再判定 → 誤検知が残り challenge 化 → Slack 通知ノイズ。ここを bounded 化)。
+    //   AI モード(udm=50)より短め (通常 SERP は数千文字が比較的早く出るため)。
+    private val MAX_SERP_REDETECTS = 4
+    private val SERP_REDETECT_INTERVAL_MS = 2500L
+
     // [2026-06-26] 同一ホストへの最小リクエスト間隔 throttle 用。
     //   nextAllowedAtByHost[host] = 「次に fetch を開始してよい時刻 (ms)」
     //   並列で来ても synchronized(throttleLock) 内で順序付けされ、
@@ -531,10 +538,16 @@ class WebViewPool(
         // [2026-06-27] WebViewClient.onReceivedHttpError で捕捉した HTTP status code。
         //   メインフレームのみ反映。デフォルト 200 (= エラーが起きなかった想定)。
         val lastHttpStatus = java.util.concurrent.atomic.AtomicInteger(200)
-        // [2026-06-27] Google /search の SPA 初期 HTML 段階で isGoogleSearchBlocked 単独判定された
-        //   ケース (本文 bodyLen <= 200) は SPA レンダリング待ちのため 3s 後に再 detect する。
-        //   一度しか scheduled しないようフラグを保持。
-        val googleSerpRedetectScheduled = AtomicBoolean(false)
+        // [2026-08-01] Google /search で isGoogleSearchBlocked 単独判定された (本文 bodyLen<=200) ケースは
+        //   SPA/低速レンダリングで本文が未生成なだけのことが多い。旧実装は 3s one-shot 再判定だったが、
+        //   誤検知が残り challenge 化していたため bounded カウンタ化 (最大 MAX_SERP_REDETECTS 回・
+        //   SERP_REDETECT_INTERVAL_MS 間隔で描画待ち)。上限到達 or timeout 予算切れで従来どおり challenge 化。
+        val serpRedetectCount = java.util.concurrent.atomic.AtomicInteger(0)
+        // [2026-08-01 Codex] 再判定待ち中フラグ。待機中に追加 onPageFinished が来てもカウンタを
+        //   早く消費しない (2.5s 間隔を保証)。true の間は runDetect が challenge 化せず待機に委ねる。
+        val serpRedetectInFlight = AtomicBoolean(false)
+        // [2026-08-01 Codex] SERP 描画待ちを timeout 予算内に収めるための fetch 開始時刻。
+        val fetchStartMs = System.currentTimeMillis()
         // [2026-06-29] AI モード (udm=50) は AI 回答描画が遅く本文が育つまで時間がかかる。
         //   bodyLen<=200 でも challenge 化せず、最大 MAX_AI_MODE_REDETECTS 回まで再判定して待つ。
         //   fetch 単位で初期化 (WebView 再利用時に状態が残らないよう doFetch スコープに置く)。
@@ -683,10 +696,19 @@ class WebViewPool(
                                 !lowerUrl.contains("google.com/sorry") &&
                                 !lowerUrl.contains("google.co.jp/sorry") &&
                                 !hasRecaptcha
-                            if (isOnlyGoogleSearchBlocked && !googleSerpRedetectScheduled.getAndSet(true)) {
-                                onLog("Google /search 初期 HTML 段階の可能性 → 3s 待機して再判定 (bodyLen=$bodyLen, worker=$workerId)")
-                                mainHandler.postDelayed({ runDetect() }, 3000L)
-                                return@evaluateJavascript
+                            if (isOnlyGoogleSearchBlocked) {
+                                // [Codex] 再判定待ち中の追加 onPageFinished は待機に委ね、challenge 化しない
+                                if (serpRedetectInFlight.get()) return@evaluateJavascript
+                                // [Codex] timeout 予算内でのみ待機 (短い timeout で待ちすぎない)
+                                val elapsedMs = System.currentTimeMillis() - fetchStartMs
+                                val budgetOkMs = request.timeout * 1000L - SERP_REDETECT_INTERVAL_MS - 2000L
+                                if (elapsedMs < budgetOkMs && serpRedetectCount.getAndIncrement() < MAX_SERP_REDETECTS) {
+                                    serpRedetectInFlight.set(true)
+                                    onLog("Google /search 本文未生成の可能性 → ${SERP_REDETECT_INTERVAL_MS}ms 後再判定 (bodyLen=$bodyLen, 試行 ${serpRedetectCount.get()}/$MAX_SERP_REDETECTS, worker=$workerId)")
+                                    mainHandler.postDelayed({ serpRedetectInFlight.set(false); runDetect() }, SERP_REDETECT_INTERVAL_MS)
+                                    return@evaluateJavascript
+                                }
+                                // 予算切れ or 上限到達 → 従来どおり challenge 化にフォールスルー
                             }
                             // チャレンジページ検知 → ユーザーに画面を表示
                             challengeDetected.set(true)
